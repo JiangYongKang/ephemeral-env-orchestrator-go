@@ -104,19 +104,30 @@ func run(stateDir string, lg *log.Logger) error {
 	g1, _ := o.Get(alice, e1.ID)
 	fmt.Printf(">> e1 after TTL: phase=%s (short-TTL env is reclaimed)\n", g1.Phase)
 
+	// On a replay (second run against the same state directory) every command
+	// key already resolved to its recorded outcome, so e2 is already terminal
+	// with zero new side effects. Report that instead of re-driving lifecycle.
+	g2, _ := o.Get(alice, e2.ID)
+	if g2.Phase.IsTerminal() {
+		used, _ := o.TenantUsage(adm, "acme")
+		fmt.Printf(">> replay/restart: e2 already %s, usage=%+v, sideEffects=%+v (no extra work)\n",
+			g2.Phase, used, be.Counts())
+		return nil
+	}
+
 	// Demonstrate a transient start wobble that self-heals: inject a single
 	// failure for e2's first start attempt. The synchronous call reports the
-	// transient error and stays converging; the background pump retries the
+	// transient error and stays converging; the next pump retries the
 	// idempotent EnsureStarted and reaches running with no duplicate resource.
 	be.WithFault(backend.Fault{FailStartAttempts: []int{1}})
 	if err := o.Start(ctx, orchestrator.StartRequest{Principal: alice, IdempotencyKey: "demo-up", EnvID: e2.ID}); err != nil {
-		fmt.Printf(">> start hit a transient wobble (retrying via background pump): %v\n", err)
+		fmt.Printf(">> start hit a transient wobble (retrying on next pump): %v\n", err)
 	}
 	be.WithFault(backend.Fault{})
 	if err := o.TriggerReconcile(ctx); err != nil {
 		return err
 	}
-	g2, _ := o.Get(alice, e2.ID)
+	g2, _ = o.Get(alice, e2.ID)
 	fmt.Printf(">> e2 started: phase=%s running=%v backendStartN=%d\n", g2.Phase, g2.Running, be.Counts().Started)
 	if err := o.Stop(ctx, orchestrator.StopRequest{Principal: alice, IdempotencyKey: "demo-down", EnvID: e2.ID}); err != nil {
 		return err
