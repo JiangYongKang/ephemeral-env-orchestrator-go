@@ -99,6 +99,7 @@ func settle(st *domain.State, key string, envID domain.EnvID, t domain.TenantID,
 // backend wobble. It returns the number of commands fully applied.
 func (r *Reconciler) Pump(ctx context.Context, st *domain.State, persist PersistFn) (int, error) {
 	applied := 0
+	var transient error
 	// Deterministic processing order by environment id: makes logs and
 	// outcomes reproducible under concurrency.
 	ids := make([]domain.EnvID, 0, len(st.Envs))
@@ -116,9 +117,12 @@ func (r *Reconciler) Pump(ctx context.Context, st *domain.State, persist Persist
 		applied += n
 		if err != nil {
 			r.log.Printf("[reconcile] env=%s paused after transient error (progress persisted): %v", id, err)
+			if transient == nil {
+				transient = err
+			}
 		}
 	}
-	return applied, nil
+	return applied, transient
 }
 
 // ReconcileEnv resumes one environment toward its desired state. Idempotent;
