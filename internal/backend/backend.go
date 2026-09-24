@@ -123,6 +123,14 @@ func (b *FakeBackend) Existing() []string {
 	return ids
 }
 
+// ForceDeleteForTest removes a resource regardless of its state, simulating an
+// out-of-band loss of the backing resource (test only).
+func (b *FakeBackend) ForceDeleteForTest(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.records, id)
+}
+
 func contains(xs []int, x int) bool {
 	for _, v := range xs {
 		if v == x {
