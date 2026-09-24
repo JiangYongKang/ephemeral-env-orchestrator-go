@@ -44,8 +44,22 @@ type Fault struct {
 	FailStartAttempts  []int
 	FailStopAttempts   []int
 	FailDeleteAttempts []int
-	// FailUntil: if set, the operation fails while now is before FailUntil.
+	// FailInspectAttempts: attempts at which Inspect fails transiently.
 	FailInspectAttempts []int
+	// PermanentX: when true the operation keeps failing with a *terminal*
+	// backend error; convergence must give up, mark the environment failed and
+	// release its reservation rather than retry forever.
+	PermanentCreate bool
+	PermanentStart  bool
+	PermanentStop   bool
+	PermanentDelete bool
+}
+
+// IsTransient reports whether a backend error is retryable. Terminal/permanent
+// backend errors return false.
+func IsTransient(err error) bool {
+	e := domain.AsError(err)
+	return e != nil && e.Kind == domain.KindBackend && e.Distinct == "transient"
 }
 
 // Backend is the resource-plane abstraction.
@@ -146,11 +160,17 @@ func transientErr(op, id string, attempt int) error {
 		"simulated transient %s failure for %s on attempt %d", op, id, attempt)
 }
 
-func (b *FakeBackend) tick(id, op string, failAttempts []int) (int, bool) {
+// permanentErr models a non-retryable resource-plane failure.
+func permanentErr(op, id string) error {
+	return domain.NewError(domain.KindBackend, "permanent",
+		"simulated permanent %s failure for %s", op, id)
+}
+
+func (b *FakeBackend) tick(id, op string, failAttempts []int, permanent bool) (int, bool, bool) {
 	key := id + "|" + op
 	b.attempts[key]++
 	n := b.attempts[key]
-	return n, contains(failAttempts, n)
+	return n, contains(failAttempts, n), permanent
 }
 
 // EnsureCreated makes sure a stopped resource with id exists. It is a no-op
@@ -161,9 +181,12 @@ func (b *FakeBackend) EnsureCreated(ctx context.Context, id string, res domain.R
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, fail := b.tick(id, "create", b.fault.FailCreateAttempts)
+	n, fail, perm := b.tick(id, "create", b.fault.FailCreateAttempts, b.fault.PermanentCreate)
 	if fail {
 		return transientErr("create", id, n)
+	}
+	if perm {
+		return permanentErr("create", id)
 	}
 	if r, ok := b.records[id]; ok {
 		// Idempotent reconciliation: keep the requested footprint aligned.
@@ -186,9 +209,12 @@ func (b *FakeBackend) EnsureStarted(ctx context.Context, id string) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, fail := b.tick(id, "start", b.fault.FailStartAttempts)
+	n, fail, perm := b.tick(id, "start", b.fault.FailStartAttempts, b.fault.PermanentStart)
 	if fail {
 		return transientErr("start", id, n)
+	}
+	if perm {
+		return permanentErr("start", id)
 	}
 	r, ok := b.records[id]
 	if !ok {
@@ -210,9 +236,12 @@ func (b *FakeBackend) EnsureStopped(ctx context.Context, id string) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, fail := b.tick(id, "stop", b.fault.FailStopAttempts)
+	n, fail, perm := b.tick(id, "stop", b.fault.FailStopAttempts, b.fault.PermanentStop)
 	if fail {
 		return transientErr("stop", id, n)
+	}
+	if perm {
+		return permanentErr("stop", id)
 	}
 	r, ok := b.records[id]
 	if !ok {
@@ -234,9 +263,12 @@ func (b *FakeBackend) EnsureDeleted(ctx context.Context, id string) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, fail := b.tick(id, "delete", b.fault.FailDeleteAttempts)
+	n, fail, perm := b.tick(id, "delete", b.fault.FailDeleteAttempts, b.fault.PermanentDelete)
 	if fail {
 		return transientErr("delete", id, n)
+	}
+	if perm {
+		return permanentErr("delete", id)
 	}
 	r, ok := b.records[id]
 	if !ok {
@@ -261,7 +293,7 @@ func (b *FakeBackend) Inspect(ctx context.Context, id string) (ResourceState, er
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n, fail := b.tick(id, "inspect", b.fault.FailInspectAttempts)
+	n, fail, _ := b.tick(id, "inspect", b.fault.FailInspectAttempts, false)
 	if fail {
 		return ResourceState{}, transientErr("inspect", id, n)
 	}

@@ -213,7 +213,32 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 		// One backend interaction (or none if already stable).
 		stable, err := r.step(ctx, st, env, act, persist)
 		if err != nil {
-			return applied, err // transient: state already persisted up to here
+			if backend.IsTransient(err) {
+				// Keep command + phase as-is; a later Pump (or restart) retries
+				// the same idempotent call.
+				return applied, err
+			}
+			// Non-retryable: settle into an explainable terminal failed phase,
+			// release the reservation atomically and fail the active command.
+			de := domain.AsError(err)
+			distinct, msg := "backend", err.Error()
+			if de != nil {
+				distinct, msg = de.Distinct, de.Msg
+			}
+			if ferr := r.fail(st, env, distinct, msg, persist); ferr != nil {
+				return applied, ferr
+			}
+			if act != nil && act.Type != domain.CmdExpire {
+				settle(st, act.DedupKey, env.ID, env.Tenant,
+					domain.NewError(domain.KindTerminal, "env_failed", "environment failed: %s", msg))
+				removeCommand(st, act.Seq)
+				env.ActiveSeq = 0
+				if perr := persist(st); perr != nil {
+					return applied, perr
+				}
+				applied++
+			}
+			return applied, nil
 		}
 		if act != nil && act.Type != domain.CmdExpire {
 			if env.ActiveSeq == 0 && env.Phase != prevPhase && !isSteady(env.Phase) {
