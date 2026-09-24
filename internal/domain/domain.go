@@ -55,6 +55,11 @@ func (r Resources) Fits(limit Resources) bool {
 	return r.CPU <= limit.CPU && r.Memory <= limit.Memory && r.Storage <= limit.Storage
 }
 
+// Equals reports exact equality on every dimension.
+func (r Resources) Equals(o Resources) bool {
+	return r.CPU == o.CPU && r.Memory == o.Memory && r.Storage == o.Storage
+}
+
 // Phase of an environment, see package docs for the state machine.
 type Phase string
 
@@ -164,13 +169,13 @@ type Environment struct {
 // DedupRecord remembers the outcome of an idempotency-keyed submission so a
 // retry returns the same outcome and performs no extra side effects.
 type DedupRecord struct {
-	Key       string     `json:"key"`
-	EnvID     EnvID      `json:"env_id"`
-	Tenant    TenantID   `json:"tenant"`
-	Done      bool       `json:"done"`
-	ErrKind   ErrorKind  `json:"err_kind,omitempty"`
-	ErrMsg    string     `json:"err_msg,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
+	Key       string    `json:"key"`
+	EnvID     EnvID     `json:"env_id"`
+	Tenant    TenantID  `json:"tenant"`
+	Done      bool      `json:"done"`
+	ErrKind   ErrorKind `json:"err_kind,omitempty"`
+	ErrMsg    string    `json:"err_msg,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // State is the complete persistent control-plane snapshot.
