@@ -42,12 +42,18 @@ func authorizeWrite(p domain.Principal, e *domain.Environment) error {
 }
 
 func validatePrincipal(p domain.Principal) error {
-	if p.Tenant == "" || p.User == "" {
+	if p.User == "" {
 		return domain.NewError(domain.KindUnauthorized, "anonymous",
-			"authenticated principal with tenant and user is required")
+			"an authenticated principal with a user is required")
 	}
 	if p.Role != domain.RoleUser && p.Role != domain.RoleAdmin {
 		return domain.NewError(domain.KindUnauthorized, "bad_role", "unknown role %q", p.Role)
+	}
+	// Admin is global and may operate across tenants (tenant may be empty);
+	// ordinary users must be scoped to exactly one tenant.
+	if p.Role == domain.RoleUser && p.Tenant == "" {
+		return domain.NewError(domain.KindUnauthorized, "tenant_required",
+			"non-admin principal must carry a tenant")
 	}
 	return nil
 }
