@@ -159,6 +159,17 @@ func dedupKey(p domain.Principal, clientKey string) string {
 
 // enqueue appends a command, persists intent first (write-ahead), then pumps.
 func (o *Orchestrator) enqueueAndPump(ctx context.Context, c domain.Command) error {
+	// Reserve the idempotency key before any side effect so a retry arriving
+	// while the first submission is still converging (or after a crash
+	// mid-creation) binds to the same environment instead of making another.
+	if c.DedupKey != "" {
+		if _, exists := o.st.Dedup[c.DedupKey]; !exists {
+			o.st.Dedup[c.DedupKey] = domain.DedupRecord{
+				Key: c.DedupKey, EnvID: c.EnvID, Tenant: c.Tenant,
+				Done: false, CreatedAt: o.clk.Now(),
+			}
+		}
+	}
 	o.st.Commands = append(o.st.Commands, c)
 	o.st.Version++
 	o.log.Printf("[submit] env=%s tenant=%s seq=%d type=%s key=%q",

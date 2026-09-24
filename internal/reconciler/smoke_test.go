@@ -30,8 +30,8 @@ func TestSmokeProvisionAndDelete(t *testing.T) {
 
 	env := &domain.Environment{
 		ID: "e1", Tenant: "t1",
-		Spec:     domain.Spec{Name: "n", Owner: "u", Requested: domain.Resources{CPU: 2, Memory: 2, Storage: 2}, DesiredRunning: true},
-		Phase:    domain.PhaseProvisioning,
+		Spec:  domain.Spec{Name: "n", Owner: "u", Requested: domain.Resources{CPU: 2, Memory: 2, Storage: 2}, DesiredRunning: true},
+		Phase: domain.PhaseProvisioning,
 	}
 	st.Envs["e1"] = env
 
@@ -70,8 +70,8 @@ func TestSmokeExpiry(t *testing.T) {
 	exp := clk.T.Add(time.Minute)
 	env := &domain.Environment{
 		ID: "e2", Tenant: "t1",
-		Spec:        domain.Spec{Owner: "u", Requested: domain.Resources{CPU: 1, Memory: 1, Storage: 1}, DesiredRunning: true},
-		Phase:       domain.PhaseRunning, Reserved: domain.Resources{CPU: 1, Memory: 1, Storage: 1},
+		Spec:  domain.Spec{Owner: "u", Requested: domain.Resources{CPU: 1, Memory: 1, Storage: 1}, DesiredRunning: true},
+		Phase: domain.PhaseRunning, Reserved: domain.Resources{CPU: 1, Memory: 1, Storage: 1},
 		Running: true, BackingIDs: []string{"env-e2"}, ExpiresAt: exp,
 	}
 	st.Envs["e2"] = env
