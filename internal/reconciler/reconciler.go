@@ -319,7 +319,12 @@ func (r *Reconciler) step(ctx context.Context, st *domain.State, env *domain.Env
 			}
 		}
 		env.BackingIDs = []string{id}
-		env.Reserved = env.Spec.Requested // reservation begins once resource exists
+		// Reservation is made at acceptance (orchestrator), not here, so that
+		// concurrent applications settle quota atomically. Backfill it only if
+		// an older/in-progress record had none.
+		if (env.Reserved == domain.Resources{}) {
+			env.Reserved = env.Spec.Requested
+		}
 		next := domain.PhaseStopped
 		if env.Spec.DesiredRunning {
 			next = domain.PhaseStarting
