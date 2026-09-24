@@ -287,6 +287,16 @@ func (r *Reconciler) step(ctx context.Context, st *domain.State, env *domain.Env
 	id := backingID(env)
 	wantDelete := act != nil && (act.Type == domain.CmdDelete || act.Type == domain.CmdExpire)
 
+	// ---- Resume an interrupted teardown even with no queued command -------
+	// This is the restart/partial-failure continuation path: the phase alone
+	// proves teardown intent must be driven to completion.
+	if env.Phase == domain.PhaseExpiring {
+		return r.stepTeardown(ctx, st, env, id, domain.CmdExpire, persist)
+	}
+	if env.Phase == domain.PhaseDeleting {
+		return r.stepTeardown(ctx, st, env, id, domain.CmdDelete, persist)
+	}
+
 	// ---- Teardown path (highest intent) -----------------------------------
 	if wantDelete {
 		return r.stepTeardown(ctx, st, env, id, act.Type, persist)
