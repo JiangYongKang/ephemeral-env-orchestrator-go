@@ -40,9 +40,24 @@ func New(be backend.Backend, clk domain.Clock, lg *log.Logger) *Reconciler {
 // the one with smallest priority, breaking ties by smallest sequence number.
 // Deterministic priority is what prevents concurrent submissions from racing:
 // e.g. a delete always wins over a queued start regardless of submit timing.
-func activeCommand(cmds []domain.Command) *domain.Command {
+// activeCommand returns the command that owns the environment for this pass.
+// A pinned in-flight command (env.ActiveSeq) always wins while it is still
+// present; otherwise the one with smallest priority wins, breaking ties by
+// smallest sequence number. Deterministic priority is what prevents concurrent
+// submissions from racing: a delete always wins over a queued start, and two
+// symmetric start/stop intents resolve by submission order.
+func activeCommand(env *domain.Environment, cmds []domain.Command) *domain.Command {
 	if len(cmds) == 0 {
 		return nil
+	}
+	if env.ActiveSeq != 0 {
+		for i := range cmds {
+			if cmds[i].Seq == env.ActiveSeq {
+				return &cmds[i]
+			}
+		}
+		// Pinned command vanished (e.g. crash cleanup); clear the pin below by
+		// falling through to a fresh choice.
 	}
 	best := 0
 	for i := 1; i < len(cmds); i++ {
@@ -150,7 +165,7 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 			return applied, err
 		}
 		cmds := commandsFor(st, env.ID)
-		act := activeCommand(cmds)
+		act := activeCommand(env, cmds)
 
 		// Expiry injection: TTL elapsed and the environment is still live and
 		// not already being torn down by an explicit delete.
@@ -165,13 +180,16 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 		}
 
 		// Pending command addressing a terminal/tombstoned environment cannot
-		// run: record a classified failure and drop it.
+		// run: record a classified failure and drop it (and any stale pin).
 		if act != nil && act.Type != domain.CmdExpire && env.Phase.IsTerminal() {
 			err := domain.NewError(domain.KindTerminal, "phase_"+string(env.Phase),
 				"command %s rejected: environment %s is %s (%s)",
 				act.Type, env.ID, env.Phase, env.FailureReason)
 			settle(st, act.DedupKey, env.ID, env.Tenant, err)
 			removeCommand(st, act.Seq)
+			if env.ActiveSeq == act.Seq {
+				env.ActiveSeq = 0
+			}
 			if perr := persist(st); perr != nil {
 				return applied, perr
 			}
@@ -179,10 +197,31 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 			continue
 		}
 
+		// Pin the command the moment it starts driving a non-steady phase, so
+		// it cannot be preempted by a momentarily-"satisfied" sibling.
+		prevPhase := env.Phase
+		// Apply the command-carried run intent only now that this command is
+		// the selected owner. Staging conflicting commands therefore cannot
+		// overwrite each other before execution.
+		if act != nil && act.Type != domain.CmdExpire && act.WantRunning != nil &&
+			env.Spec.DesiredRunning != *act.WantRunning {
+			env.Spec.DesiredRunning = *act.WantRunning
+			r.log.Printf("[reconcile] env=%s applying intent desired_running=%t from command seq=%d",
+				env.ID, *act.WantRunning, act.Seq)
+		}
+
 		// One backend interaction (or none if already stable).
 		stable, err := r.step(ctx, st, env, act, persist)
 		if err != nil {
 			return applied, err // transient: state already persisted up to here
+		}
+		if act != nil && act.Type != domain.CmdExpire {
+			if env.ActiveSeq == 0 && env.Phase != prevPhase && !isSteady(env.Phase) {
+				env.ActiveSeq = act.Seq
+				if perr := persist(st); perr != nil {
+					return applied, perr
+				}
+			}
 		}
 
 		// Synthetic expire: once terminated there is no queued record to clear.
@@ -196,6 +235,7 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 				env.ID, act.Seq, act.Type, describe(env))
 			settle(st, act.DedupKey, env.ID, env.Tenant, nil)
 			removeCommand(st, act.Seq)
+			env.ActiveSeq = 0
 			if err := persist(st); err != nil {
 				return applied, err
 			}
@@ -204,10 +244,20 @@ func (r *Reconciler) convergeEnv(ctx context.Context, st *domain.State, env *dom
 		}
 
 		if stable {
+			// Steady state with no concrete command to apply: drop a stale pin.
+			if env.ActiveSeq != 0 {
+				env.ActiveSeq = 0
+				_ = r.commit(st, env, persist)
+			}
 			return applied, nil
 		}
 	}
 	return applied, fmt.Errorf("env %s did not converge within step budget", env.ID)
+}
+
+// isSteady reports a quiescent phase (no multi-step transition in flight).
+func isSteady(p domain.Phase) bool {
+	return p == domain.PhaseRunning || p == domain.PhaseStopped
 }
 
 // teardownDue decides whether an expire must be injected now.

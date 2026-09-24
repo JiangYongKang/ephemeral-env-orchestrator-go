@@ -117,16 +117,18 @@ const (
 )
 
 // Priority defines deterministic conflict resolution: smaller wins.
-// Delete/expire (teardown) beat mutating lifecycle ops, which beat start/stop.
+// Teardown (delete/expire) always wins; recovery precedes mutating lifecycle
+// ops; start and stop are a symmetric pair (same bucket) so that between them
+// the tie-break is strictly the oldest sequence number.
 func (c CommandType) Priority() int {
 	switch c {
 	case CmdDelete, CmdExpire:
 		return 0
 	case CmdRecover:
 		return 1
-	case CmdCreate, CmdUpdate, CmdStop:
+	case CmdCreate, CmdUpdate:
 		return 2
-	case CmdStart:
+	case CmdStart, CmdStop:
 		return 3
 	default:
 		return 9
@@ -136,13 +138,17 @@ func (c CommandType) Priority() int {
 // Command is a unit of intent. Commands are persisted before any side effect
 // so an interrupted process can resume; the dedup key makes retries idempotent.
 type Command struct {
-	Seq        int64       `json:"seq"`
-	EnvID      EnvID       `json:"env_id"`
-	Tenant     TenantID    `json:"tenant"`
-	Type       CommandType `json:"type"`
-	DedupKey   string      `json:"dedup_key"`
-	SpecPatch  *Spec       `json:"spec_patch,omitempty"`
-	EnqueuedAt time.Time   `json:"enqueued_at"`
+	Seq       int64       `json:"seq"`
+	EnvID     EnvID       `json:"env_id"`
+	Tenant    TenantID    `json:"tenant"`
+	Type      CommandType `json:"type"`
+	DedupKey  string      `json:"dedup_key"`
+	SpecPatch *Spec       `json:"spec_patch,omitempty"`
+	// WantRunning carries the run/stop intent for CmdStart/CmdStop. It lives on
+	// the command (not the environment) so staging conflicting lifecycle
+	// intents does not clobber each other before they execute.
+	WantRunning *bool     `json:"want_running,omitempty"`
+	EnqueuedAt  time.Time `json:"enqueued_at"`
 }
 
 // Environment is the full persisted record: spec + observed status.
@@ -164,6 +170,11 @@ type Environment struct {
 	FailureReason string `json:"failure_reason,omitempty"`
 	// LastSeq is the highest command seq already fully applied.
 	LastSeq int64 `json:"last_seq"`
+	// ActiveSeq, when non-zero, pins the command currently driving a
+	// multi-step transition, giving it "stickiness" until it completes. This
+	// guarantees a queued start cannot be judged satisfied mid-stop just
+	// because the environment is momentarily running.
+	ActiveSeq int64 `json:"active_seq"`
 }
 
 // DedupRecord remembers the outcome of an idempotency-keyed submission so a

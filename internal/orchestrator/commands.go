@@ -329,13 +329,14 @@ func (o *Orchestrator) Update(ctx context.Context, req UpdateRequest) (*domain.E
 			env.ExpiresAt = time.Time{}
 		}
 	}
-	if req.DesiredRunning != nil {
-		env.Spec.DesiredRunning = *req.DesiredRunning
-	}
+	// DesiredRunning is carried by the command payload and applied by the
+	// reconciler when the update is the active command, so it composes
+	// correctly with concurrently staged start/stop intents.
 
 	c := domain.Command{
 		Seq: o.nextSeq(), EnvID: env.ID, Tenant: env.Tenant,
 		Type: domain.CmdUpdate, DedupKey: key, EnqueuedAt: o.clk.Now(),
+		WantRunning: req.DesiredRunning,
 	}
 	if err := o.enqueueAndPump(ctx, c); err != nil {
 		return cloneEnv(env), err
@@ -377,16 +378,15 @@ func (o *Orchestrator) lifecycleCmd(ctx context.Context, p domain.Principal, ide
 			"cannot %s a terminal environment", typ)
 		return err
 	}
-	env.Spec.DesiredRunning = want
 	c := domain.Command{
 		Seq: o.nextSeq(), EnvID: id, Tenant: env.Tenant,
-		Type: typ, DedupKey: key, EnqueuedAt: o.clk.Now(),
+		Type: typ, DedupKey: key, EnqueuedAt: o.clk.Now(), WantRunning: boolp(want),
 	}
 	err := o.enqueueAndPump(ctx, c)
 	return err
 }
 
-// StartRequest issues a start intent.
+func boolp(b bool) *bool { return &b } // StartRequest issues a start intent.
 type StartRequest struct {
 	Principal      domain.Principal
 	IdempotencyKey string
@@ -410,6 +410,54 @@ type DeleteRequest struct {
 // Start requests an environment to be running.
 func (o *Orchestrator) Start(ctx context.Context, req StartRequest) error {
 	return o.lifecycleCmd(ctx, req.Principal, req.IdempotencyKey, req.EnvID, domain.CmdStart, true)
+}
+
+// enqueueLifecycleIntent persists a start/stop/delete intent without pumping,
+// so callers (and tests) can stage several conflicting commands and observe
+// the deterministic priority resolution on a single convergence pass.
+func (o *Orchestrator) enqueueLifecycleIntent(p domain.Principal, id domain.EnvID, typ domain.CommandType, want bool) error {
+	if err := validatePrincipal(p); err != nil {
+		return err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	env, ok := o.st.Envs[id]
+	if !ok {
+		return domain.NewError(domain.KindNotFound, "env", "environment %s not found", id)
+	}
+	if err := authorizeWrite(p, env); err != nil {
+		return err
+	}
+	if env.Phase.IsTerminal() {
+		return domain.NewError(domain.KindTerminal, "phase_"+string(env.Phase),
+			"cannot %s a terminal environment", typ)
+	}
+	c := domain.Command{
+		Seq: o.nextSeq(), EnvID: id, Tenant: env.Tenant,
+		Type: typ, DedupKey: "", EnqueuedAt: o.clk.Now(),
+	}
+	if typ == domain.CmdStart || typ == domain.CmdStop {
+		c.WantRunning = boolp(want)
+	}
+	o.st.Commands = append(o.st.Commands, c)
+	o.st.Version++
+	o.log.Printf("[stage] env=%s seq=%d type=%s (no immediate pump)", id, c.Seq, typ)
+	return o.persistLocked(o.st)
+}
+
+// EnqueueStartIntent stages a start without converging (helper/test use).
+func (o *Orchestrator) EnqueueStartIntent(p domain.Principal, id domain.EnvID) error {
+	return o.enqueueLifecycleIntent(p, id, domain.CmdStart, true)
+}
+
+// EnqueueDeleteIntent stages a delete without converging (helper/test use).
+func (o *Orchestrator) EnqueueDeleteIntent(p domain.Principal, id domain.EnvID) error {
+	return o.enqueueLifecycleIntent(p, id, domain.CmdDelete, false)
+}
+
+// EnqueueStopIntent stages a stop without converging (helper/test use).
+func (o *Orchestrator) EnqueueStopIntent(p domain.Principal, id domain.EnvID) error {
+	return o.enqueueLifecycleIntent(p, id, domain.CmdStop, false)
 }
 
 // Stop requests an environment to be stopped (resources retained, quota held).
