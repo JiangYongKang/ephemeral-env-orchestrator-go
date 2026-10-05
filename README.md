@@ -56,7 +56,55 @@
 `Delete(0) > Stop(1) > Update(2) > Start(3) > Create(4)`。
 因此并发 start/stop/delete 时删除必胜，资源一定被释放，竞态无法绕过权限或多占资源。重复提交相同操作在入队前去重，不产生额外操作或副作用。
 
-## 4. 错误类型
+## 4. 清单（Manifest）：一次提交一整套环境声明
+
+`internal/orchestrator/manifest.go` 提供 `PreviewManifest` / `ApplyManifest` 两个入口，用一份清单声明整套环境的期望状态。
+
+### 声明格式
+
+每个清单条目（`ManifestItem`）声明一个环境的完整期望状态：
+
+| 字段 | 含义 |
+| --- | --- |
+| `name` | 租户内唯一名称（必填），清单按 name 与现有环境匹配 |
+| `image` / `replicas` / `resources` / `ttlSeconds` | 与单环境 Create 相同的声明字段（`desired: Deleted` 条目可省略） |
+| `desired` | `Running`（缺省）/ `Stopped` / `Deleted`；`Deleted` 表示"该环境应不存在" |
+
+### 预览语义（只读）
+
+`PreviewManifest` 返回 `Plan`：
+
+- 每个条目的动作：`Create` / `Update` / `Delete` / `NoOp`，附关键声明差异（`Diff`，before→after）与判定依据（`Reason`）；
+- 整份清单在租户与集群两个层面的**净预留变化**（`TenantDelta` / `ClusterDelta`，负值表示释放）；
+- `Applicable` 与 `RejectReason`：整批是否可应用及原因。
+
+预览**不修改任何环境、操作、配额或持久化状态**（测试用状态文件字节级对比验证）；同一状态下同一清单的预览结果完全确定。
+
+### 应用语义（整批全有或全无的准入）
+
+`ApplyManifest` 在同一把状态锁内先算出与预览完全相同的计划：
+
+- 任一条目不可准入（越权 `Forbidden`、声明非法 `ValidationError`、删除进行中冲突 `Conflict`），或整批净变化超出租户配额/集群容量（`QuotaExceeded`）→ **整批拒绝**，逐项给出分类原因，且**零副作用**：不改任何环境、不挪动状态、不延长有效期、不落盘；
+- 准入成功 → 所有声明（环境记录、期望状态、排队操作）在**一次原子落盘**中持久化，随后由现有收敛循环异步收敛；中途崩溃要么整批丢失、要么整批继续收敛，绝不出现部分批次。
+
+### 容量结算：整批净变化
+
+整批资源判定按**净变化**一次结算：同批中删除/停止释放的预留，可以资助同批中新建/扩容的需求（如删 800m + 建 900m = 净 +100m，只要 100m 放得下即整批通过）。判定与条目内部顺序无关，不会出现"总量放得下却被执行顺序挡住"。
+
+### 冲突处理
+
+- **清单内同名冲突**：确定性"后者胜"（last-wins），被覆盖的条目标记为 `NoOp` 并注明原因；净变化只计入获胜条目，不会借机多占资源或越过权限。
+- **与进行中的删除冲突**：环境删除进行中又被声明存在 → 该条目 `Conflict`（整批随之拒绝），删除完成后重交即可。
+- **过期环境**：清单声明 `Running` 即续期（应用时以当前时间重新锚定有效期）。
+- **Failed 环境**：清单重新声明 `Running` 即显式重试。
+
+### 幂等、并发与部分失败
+
+- 重复应用同一清单：已满足的条目为 `NoOp`，相同操作入队去重；全部 `NoOp` 时连状态文件都不重写，后端零调用；
+- 并发重复提交：准入在单一互斥锁内串行化，最终只产生一份环境与资源；
+- 部分条目在**收敛阶段**失败（如后端持续故障）：该环境进入 `Failed` 并记录 `failReason`，其余条目正常收敛，可逐一查询"哪些成了、哪些没成、为什么"；修复后重放同一清单即可让失败条目继续收敛到同一结果。
+
+## 5. 错误类型
 
 定义于 `internal/errors`，用 `errors.Is(err, errors.KindXxx)` 分类：
 
@@ -74,12 +122,12 @@
 
 终态 `Failed` 的原因写入环境记录的 `failReason`，可通过查询解释。
 
-## 5. 持久化与重启恢复
+## 6. 持久化与重启恢复
 
 - 单一状态文档 `State{envs, quotas, capacity, operations, seq}` 写入 `<path>.tmp` → `fsync` → 原子 `rename` → 目录 `fsync`；崩溃时文件要么是旧完整版、要么是新完整版。
 - 启动时 `Load` 后将所有持久化 allocation `Reattach` 到新的模拟后端（模拟真实云资源比控制进程长寿），再执行 `recover`：依据 desired + 存活 allocation 修复 `Pending/Starting/Stopping/Deleting/Failed` 等中间态，未完成操作继续按优先级驱动。
 
-## 6. 本地验证方法
+## 7. 本地验证方法
 
 需要 Go 1.25+，无外部依赖：
 
@@ -98,9 +146,10 @@ go run ./cmd/demo              # 端到端演示；再运行一次即"进程重�
 - 后端前 N 次失败重试、持续失败进入 `Failed` 及显式恢复、删除中断后续跑；
 - 冲突操作优先级（Delete 胜过 in-flight Create，无资源泄漏）；
 - 运行中重启恢复、创建中途重启、删除中途重启（reattach + 续跑，无重复/泄漏）；
-- TTL 过期回收、过期直接 Start 冲突、续期重启、回收配额复用。
+- TTL 过期回收、过期直接 Start 冲突、续期重启、回收配额复用；
+- 清单（Manifest）：预览只读且结果确定、整批净变化结算（先释放后占用复用）、整批超额整体拒绝且零副作用、越权/非法/配额逐项分类、幂等重放、并发重复提交、重启后续收敛、清单内同名冲突 last-wins、部分条目收敛失败可解释且可重放恢复。
 
-## 7. 代码结构
+## 8. 代码结构
 
 ```
 internal/model          声明模型、状态机、资源向量与派生用量
@@ -108,6 +157,7 @@ internal/errors         可分类错误类型
 internal/store          原子文件持久化（JSON + tmp/fsync/rename）
 internal/quota          租户配额 / 集群容量的保留量结算
 internal/resource       可注入故障的幂等模拟资源后端 + 重启 reattach
-internal/orchestrator   CRUD、授权、确定性优先操作队列、可恢复收敛循环
+internal/orchestrator   CRUD、授权、确定性优先操作队列、可恢复收敛循环、
+                        清单预览/整批应用（manifest.go）
 cmd/demo                本地端到端演示
 ```
