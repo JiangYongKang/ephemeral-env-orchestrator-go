@@ -124,6 +124,7 @@ type State struct {
 	Quotas     map[string]*TenantQuota `json:"quota"`
 	Capacity   ClusterCapacity         `json:"capacity"`
 	Operations []*Operation            `json:"operations"`
+	Batches    map[string]*Batch       `json:"batches,omitempty"`
 	Seq        int64                   `json:"seq"`
 	UpdatedAt  time.Time               `json:"updatedAt"`
 }

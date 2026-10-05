@@ -123,3 +123,45 @@ func (c *Checker) checkExcluding(st *model.State, tenantID string, oldRes, newRe
 	}
 	return true, ""
 }
+
+// CheckNet validates applying a NET reservation delta (which may be negative
+// in any dimension) on top of current reservations. A manifest batch is
+// settled this way: releases from deletes/stops in the same batch are netted
+// against acquisitions from creates/expansions, so freed capacity is reusable
+// within the batch regardless of execution order. Only the summed result
+// must fit; per-item intermediate states are irrelevant.
+func (c *Checker) CheckNet(st *model.State, tenantID string, delta model.Resources) (bool, string) {
+	q, ok := st.Quotas[tenantID]
+	if !ok {
+		return false, fmt.Sprintf("tenant %q has no quota configured", tenantID)
+	}
+	tRes := model.TenantReserved(st, tenantID)
+	if tRes.CPUMilli+delta.CPUMilli > q.CPUMilli {
+		return false, fmt.Sprintf("tenant %q cpu quota exceeded by batch net change: reserved=%d + net=%+d > limit=%d milli",
+			tenantID, tRes.CPUMilli, delta.CPUMilli, q.CPUMilli)
+	}
+	if tRes.MemoryMB+delta.MemoryMB > q.MemoryMB {
+		return false, fmt.Sprintf("tenant %q memory quota exceeded by batch net change: reserved=%d + net=%+d > limit=%d MB",
+			tenantID, tRes.MemoryMB, delta.MemoryMB, q.MemoryMB)
+	}
+	if tRes.StorageGB+delta.StorageGB > q.StorageGB {
+		return false, fmt.Sprintf("tenant %q storage quota exceeded by batch net change: reserved=%d + net=%+d > limit=%d GB",
+			tenantID, tRes.StorageGB, delta.StorageGB, q.StorageGB)
+	}
+
+	cap := st.Capacity
+	cRes := model.ClusterReserved(st)
+	if cRes.CPUMilli+delta.CPUMilli > cap.CPUMilli {
+		return false, fmt.Sprintf("cluster cpu capacity exceeded by batch net change: reserved=%d + net=%+d > capacity=%d milli",
+			cRes.CPUMilli, delta.CPUMilli, cap.CPUMilli)
+	}
+	if cRes.MemoryMB+delta.MemoryMB > cap.MemoryMB {
+		return false, fmt.Sprintf("cluster memory capacity exceeded by batch net change: reserved=%d + net=%+d > capacity=%d MB",
+			cRes.MemoryMB, delta.MemoryMB, cap.MemoryMB)
+	}
+	if cRes.StorageGB+delta.StorageGB > cap.StorageGB {
+		return false, fmt.Sprintf("cluster storage capacity exceeded by batch net change: reserved=%d + net=%+d > capacity=%d GB",
+			cRes.StorageGB, delta.StorageGB, cap.StorageGB)
+	}
+	return true, ""
+}

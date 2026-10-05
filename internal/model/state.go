@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 // NewState returns the initial empty control-plane document.
 func NewState() *State {
@@ -9,6 +12,7 @@ func NewState() *State {
 		Envs:       map[string]*Environment{},
 		Quotas:     map[string]*TenantQuota{},
 		Operations: []*Operation{},
+		Batches:    map[string]*Batch{},
 	}
 }
 
@@ -19,6 +23,13 @@ func (r Resources) Mul(n int) Resources {
 	}
 	return Resources{CPUMilli: r.CPUMilli * n, MemoryMB: r.MemoryMB * n, StorageGB: r.StorageGB * n}
 }
+
+// String renders the vector compactly for diffs and logs.
+func (r Resources) String() string {
+	return "{cpuMilli:" + itoa(r.CPUMilli) + " memoryMB:" + itoa(r.MemoryMB) + " storageGB:" + itoa(r.StorageGB) + "}"
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // Add sums two resource vectors.
 func (r Resources) Add(o Resources) Resources {

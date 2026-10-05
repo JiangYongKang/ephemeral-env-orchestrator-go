@@ -105,7 +105,10 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 		}
 	}
 
-	// 3) Prune finished operations to keep the document bounded.
+	// 3) Reflect finished operations into manifest batch items.
+	changed = o.updateBatchesLocked() || changed
+
+	// 4) Prune finished operations to keep the document bounded.
 	if pruned := o.pruneDoneLocked(); pruned > 0 {
 		changed = true
 	}
@@ -285,7 +288,18 @@ func (o *Orchestrator) applyStart(ctx context.Context, env *model.Environment, o
 	// reservation and simply retries materialization.
 	needsReservation := env.Phase == model.PhaseStopped || env.Phase == model.PhaseExpired
 	if needsReservation {
-		if ok, reason := o.quota.Fits(o.st, env.Spec.TenantID, env.Spec.Requested()); !ok {
+		req := env.Spec.Requested()
+		var ok bool
+		var reason string
+		if env.Desired == model.DesiredRunning {
+			// The API already recorded the reservation in Desired; re-verify
+			// the TOTAL still fits (same pattern as convergeRunning) instead
+			// of adding the request a second time.
+			ok, reason = o.quota.CheckChange(o.st, env.Spec.TenantID, req, req)
+		} else {
+			ok, reason = o.quota.Fits(o.st, env.Spec.TenantID, req)
+		}
+		if !ok {
 			env.Attempts++
 			if env.Attempts >= MaxBackendAttempts {
 				env.FailReason = "cannot start: quota insufficient: " + reason
@@ -502,15 +516,55 @@ func (o *Orchestrator) recoverLocked() {
 			"envId", env.ID, "desired", env.Desired, "phase", env.Phase,
 			"liveAllocations", live, "pendingOpsForEnv", o.pendingOpForLocked(env.ID))
 	}
+	// Manifest batches survive restarts: any pending item whose operation is
+	// no longer on record is re-derived so the apply keeps converging.
+	for _, b := range o.st.Batches {
+		if b.Done {
+			continue
+		}
+		for _, bi := range b.Items {
+			if bi.Terminal() {
+				continue
+			}
+			missing := len(bi.OpIDs) == 0
+			for _, opID := range bi.OpIDs {
+				if o.findOpLocked(opID) == nil {
+					missing = true
+					break
+				}
+			}
+			if missing {
+				o.log.Info("recover: manifest item missing its operation; re-deriving",
+					"manifest", b.ID, "index", bi.Index, "name", bi.Name)
+				o.recoverBatchItemLocked(b, bi)
+			}
+		}
+	}
 }
 
 // pruneDoneLocked removes finished operations that are not needed for
-// restart semantics, keeping the persisted document bounded.
+// restart semantics, keeping the persisted document bounded. Operations
+// referenced by a still-pending manifest batch item are retained until the
+// batch item has observed their outcome.
 func (o *Orchestrator) pruneDoneLocked() int {
+	protected := map[string]bool{}
+	for _, b := range o.st.Batches {
+		if b.Done {
+			continue
+		}
+		for _, bi := range b.Items {
+			if bi.Terminal() {
+				continue
+			}
+			for _, id := range bi.OpIDs {
+				protected[id] = true
+			}
+		}
+	}
 	keep := o.st.Operations[:0]
 	n := 0
 	for _, op := range o.st.Operations {
-		if op.Done {
+		if op.Done && !protected[op.ID] {
 			n++
 			continue
 		}
@@ -518,6 +572,131 @@ func (o *Orchestrator) pruneDoneLocked() int {
 	}
 	o.st.Operations = keep
 	return n
+}
+
+// findOpLocked locates an operation by ID (pending or not-yet-pruned).
+func (o *Orchestrator) findOpLocked(id string) *model.Operation {
+	for _, op := range o.st.Operations {
+		if op.ID == id {
+			return op
+		}
+	}
+	return nil
+}
+
+// updateBatchesLocked folds operation outcomes into manifest batch items so
+// every apply stays explainable: which items converged, which failed and why.
+func (o *Orchestrator) updateBatchesLocked() bool {
+	changed := false
+	for _, b := range o.st.Batches {
+		if b.Done {
+			continue
+		}
+		for _, bi := range b.Items {
+			if bi.Terminal() {
+				continue
+			}
+			allDone, missing := true, false
+			for _, opID := range bi.OpIDs {
+				op := o.findOpLocked(opID)
+				if op == nil {
+					missing = true
+					break
+				}
+				if !op.Done {
+					allDone = false
+					break
+				}
+				if op.Rejected {
+					bi.Status = model.BatchItemFailed
+					bi.Reason = op.Message
+					changed = true
+					o.log.Warn("manifest item failed",
+						"manifest", b.ID, "index", bi.Index, "name", bi.Name,
+						"envId", bi.EnvID, "reason", bi.Reason)
+					break
+				}
+			}
+			if bi.Terminal() {
+				continue
+			}
+			if missing {
+				// Defensive: prune protection makes this unreachable, but a
+				// hand-edited or corrupted document must not wedge the batch.
+				o.recoverBatchItemLocked(b, bi)
+				changed = true
+				continue
+			}
+			if allDone && len(bi.OpIDs) > 0 {
+				bi.Status = model.BatchItemApplied
+				changed = true
+				o.log.Info("manifest item converged",
+					"manifest", b.ID, "index", bi.Index, "name", bi.Name, "envId", bi.EnvID)
+			}
+		}
+		if !b.Done && allItemsTerminal(b.Items) {
+			b.Done = true
+			changed = true
+			o.log.Info("manifest batch complete", "manifest", b.ID, "items", len(b.Items))
+		}
+		if changed {
+			b.UpdatedAt = o.now()
+		}
+	}
+	return changed
+}
+
+// recoverBatchItemLocked re-derives a pending batch item whose operation
+// record is missing: satisfied intents are closed, unsatisfied ones get a
+// fresh operation so the batch keeps converging after any interruption.
+func (o *Orchestrator) recoverBatchItemLocked(b *model.Batch, bi *model.BatchItem) {
+	env := o.envLocked(bi.EnvID)
+	if bi.Action == model.ManifestDelete {
+		if env == nil {
+			bi.Status = model.BatchItemApplied
+			bi.Note = appendNote(bi.Note, "confirmed absent after recovery")
+			return
+		}
+	} else if env != nil && bi.Spec != nil && env.Spec == *bi.Spec &&
+		env.Desired == bi.Desired && !phaseTransitioning(env.Phase) && env.Phase != model.PhaseFailed {
+		bi.Status = model.BatchItemApplied
+		bi.Note = appendNote(bi.Note, "confirmed converged after recovery")
+		return
+	}
+	if env == nil {
+		bi.Status = model.BatchItemFailed
+		bi.Reason = "environment record missing after recovery; cannot re-drive item"
+		o.log.Warn("manifest item unrecoverable", "manifest", b.ID, "index", bi.Index, "name", bi.Name)
+		return
+	}
+	actor := Actor{Name: b.Actor, TenantID: b.TenantID, Role: RoleOwner}
+	var op *model.Operation
+	switch bi.Action {
+	case model.ManifestDelete:
+		env.Desired = model.DesiredDeleted
+		op = o.enqueueLocked(model.OpDelete, env.ID, actor, nil)
+	case model.ManifestUpsert:
+		if bi.Spec != nil && env.Spec != *bi.Spec {
+			specCopy := *bi.Spec
+			op = o.enqueueLocked(model.OpUpdate, env.ID, actor, &specCopy)
+		}
+		if bi.Desired == model.DesiredStopped && env.Desired != model.DesiredStopped {
+			env.Desired = model.DesiredStopped
+			op = o.enqueueLocked(model.OpStop, env.ID, actor, nil)
+		}
+		if bi.Desired == model.DesiredRunning && (env.Desired != model.DesiredRunning || env.Phase == model.PhaseFailed) {
+			env.Desired = model.DesiredRunning
+			op = o.enqueueLocked(model.OpStart, env.ID, actor, nil)
+		}
+	}
+	if op != nil {
+		bi.OpIDs = []string{op.ID}
+		o.log.Info("manifest item re-driven after recovery",
+			"manifest", b.ID, "index", bi.Index, "name", bi.Name, "op", op.ID)
+	} else {
+		bi.Status = model.BatchItemApplied
+		bi.Note = appendNote(bi.Note, "no residual work after recovery")
+	}
 }
 
 // ---- small helpers ------------------------------------------------------

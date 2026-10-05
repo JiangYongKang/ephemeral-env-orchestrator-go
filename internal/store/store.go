@@ -62,6 +62,9 @@ func (s *Store) Load() (*model.State, error) {
 	if st.Quotas == nil {
 		st.Quotas = map[string]*model.TenantQuota{}
 	}
+	if st.Batches == nil {
+		st.Batches = map[string]*model.Batch{}
+	}
 	return st, nil
 }
 

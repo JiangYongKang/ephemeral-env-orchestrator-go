@@ -56,7 +56,54 @@
 `Delete(0) > Stop(1) > Update(2) > Start(3) > Create(4)`。
 因此并发 start/stop/delete 时删除必胜，资源一定被释放，竞态无法绕过权限或多占资源。重复提交相同操作在入队前去重，不产生额外操作或副作用。
 
-## 4. 错误类型
+## 4. 清单：一次提交一整套环境声明
+
+清单（Manifest，`internal/model/manifest.go`）把一整套环境的期望声明打包提交，先预览、确认后再应用。
+
+**声明格式**
+
+```json
+{
+  "items": [
+    {"name": "web",   "image": "img:1", "replicas": 3,
+     "resources": {"cpuMilli": 100, "memoryMB": 128, "storageGB": 1},
+     "ttlSeconds": 3600, "desired": "Running"},
+    {"name": "cache", "desired": "Stopped", "image": "img:2", "replicas": 1,
+     "resources": {"cpuMilli": 100, "memoryMB": 128, "storageGB": 1}},
+    {"name": "old",   "action": "Delete"}
+  ]
+}
+```
+
+- 每个条目默认 `action: "Upsert"`、`desired: "Running"`；Upsert 是**全量声明**（image/replicas/resources/ttlSeconds/desired 整体覆盖可变字段），`owner`/`tenantId` 不可变、由系统从现有环境或调用者身份填充。
+- `action: "Delete"` 表示该名字的环境必须不存在（删除是幂等的，已不存在则为 NoOp）。清单不做隐式 prune：没出现在清单里的环境不受影响。
+- 清单 ID 是内容寻址的 `mf-<hash>`（租户 + 规范化条目集的 SHA-256）：同一份清单重复或并发提交都映射到同一个批次，这是幂等的基石。
+
+**预览语义（`PreviewManifest`，只读）**
+
+- 逐项给出分类：`Create` / `Update` / `Delete` / `NoOp`，附改动前后的关键声明（`before`/`after` spec）、字段级 `diff`（如 `replicas: 2 -> 3`）、该项的资源预留增减 `delta`。
+- 汇总整份清单在**租户配额**与**集群容量**两个层面的净变化（`tenantDelta`/`clusterDelta`）以及是否放得下（`admissible` + 原因）。
+- 纯函数：不创建/修改/删除任何环境、操作、批次或配额；同一（状态, 清单）对的反复预览结果字节级一致。
+
+**应用语义（`ApplyManifest`，整批原子准入）**
+
+- 应用时的判定逻辑与预览完全共用（`planLocked`），因此实际结果与预览一致。
+- **容量按整批净变化结算**：同一批里删除/停止释放的额度可以供养同批的新建/扩容（`quota.CheckNet` 允许负 delta），与条目执行顺序无关。全局操作优先级 `Delete > Stop > Update > Start > Create` 保证执行时也是先释放后占用。
+- **整批拒绝**：任一条目越权（`Forbidden`）/声明非法（`ValidationError`），或整批净变化超出租户配额/集群容量（`QuotaExceeded`），则整批拒绝并返回 `*BatchRejection`，其中逐项标注被拒原因与分类；被拒绝时**一个环境都不会被改动**——不建环境、不动 Desired、不延有效期、不留批次记录。
+- 准入成功后，批次记录（`Batch`）与操作队列在**同一次原子持久化**中落盘，由收敛循环执行；`GetBatch` 可查询每项的最终结果（`Applied`/`Failed` + 原因），批次仅提交者本人与 admin 可见。
+
+**冲突处理规则（确定且可解释）**
+
+同一清单内针对同一名字的多个条目折叠为一个生效条目：**Delete 永远赢**（与全局操作优先级一致）；没有 Delete 时**文档顺序中最后一条 Upsert 赢**。被压制的条目标记为 NoOp 并在 `note` 中指明被谁压制（如 `superseded by item #2 (Delete wins over Upsert for the same name)`）。冲突折叠发生在配额结算之前，不会借机多占资源；权限校验对每个生效条目独立进行，不会借机越权。
+
+**收敛、幂等与中断恢复**
+
+- 重复应用同一份清单：已满足环境的条目在计划阶段即为 NoOp，相同意图的操作入队前去重，批次记录复用——不产生任何多余动作或后端调用；并发提交同一份清单会折叠到同一个批次。
+- 应用可在任意时刻被打断（进程重启、后端抖动）：批次与操作都已持久化，重启后 `recover` 会检查每个未完成条目，操作记录缺失时按条目携带的目标声明重新推导/补发操作，继续向同一结果收敛；后端按确定性 allocation ID 幂等，不会重复建资源或泄漏。
+- 对声明未变但处于 `Failed` 的环境再次应用同一清单，是文档化的重试路径（自动补发 Start，重置失败计数）。
+- 部分条目最终失败（如后端持续故障）：批次整体标记完成，逐项可解释——哪项 `Applied`、哪项 `Failed` 及具体原因（来自操作的可解释拒绝信息）。
+
+## 5. 错误类型
 
 定义于 `internal/errors`，用 `errors.Is(err, errors.KindXxx)` 分类：
 
@@ -74,12 +121,14 @@
 
 终态 `Failed` 的原因写入环境记录的 `failReason`，可通过查询解释。
 
-## 5. 持久化与重启恢复
+清单整批拒绝时返回 `*orchestrator.BatchRejection`（可用 `errors.As` 取出）：`Kind` 给出批次级分类（任一条目越权/非法时为首个条目错误的分类，净变化超额时为 `QuotaExceeded`），`Items` 逐项携带分类后的原因字符串（前缀即错误分类），可区分越权、声明非法与资源不够三种拒绝。
 
-- 单一状态文档 `State{envs, quotas, capacity, operations, seq}` 写入 `<path>.tmp` → `fsync` → 原子 `rename` → 目录 `fsync`；崩溃时文件要么是旧完整版、要么是新完整版。
-- 启动时 `Load` 后将所有持久化 allocation `Reattach` 到新的模拟后端（模拟真实云资源比控制进程长寿），再执行 `recover`：依据 desired + 存活 allocation 修复 `Pending/Starting/Stopping/Deleting/Failed` 等中间态，未完成操作继续按优先级驱动。
+## 6. 持久化与重启恢复
 
-## 6. 本地验证方法
+- 单一状态文档 `State{envs, quotas, capacity, operations, batches, seq}` 写入 `<path>.tmp` → `fsync` → 原子 `rename` → 目录 `fsync`；崩溃时文件要么是旧完整版、要么是新完整版。
+- 启动时 `Load` 后将所有持久化 allocation `Reattach` 到新的模拟后端（模拟真实云资源比控制进程长寿），再执行 `recover`：依据 desired + 存活 allocation 修复 `Pending/Starting/Stopping/Deleting/Failed` 等中间态，未完成操作继续按优先级驱动；未完成的清单批次逐项重推导（操作缺失时按条目携带的目标声明补发），继续向同一结果收敛。
+
+## 7. 本地验证方法
 
 需要 Go 1.25+，无外部依赖：
 
@@ -100,14 +149,30 @@ go run ./cmd/demo              # 端到端演示；再运行一次即"进程重�
 - 运行中重启恢复、创建中途重启、删除中途重启（reattach + 续跑，无重复/泄漏）；
 - TTL 过期回收、过期直接 Start 冲突、续期重启、回收配额复用。
 
-## 7. 代码结构
+清单覆盖（`internal/orchestrator/manifest_test.go`，日志逐项打印分类、判定依据与状态走向）：
+- 预览只读且确定：反复预览字节一致，环境/操作/批次/预留一概不变，更新项带前后 spec 与字段级 diff；
+- 整批净变化结算：删除/停止释放的额度供养同批新建（净零批次在满配额下准入并收敛）；
+- 整批拒绝：净超额整批拒绝且零副作用（不建环境、不动 Desired、不延有效期、不留批次）；越权/非法/配额三类原因逐项分类，合法条目不渗漏；
+- 幂等与并发：重复应用同清单零新操作零后端调用，8 路并发提交折叠为同一批次、不产生重复环境；
+- 冲突确定性：Delete 胜过 Upsert、后者覆盖前者，预览与批次 note 均可解释；
+- 中断收敛：应用中途"进程崩溃"（后端阻塞创建）后重启续跑，批次完成、无重复无泄漏；
+- 部分失败可解释：单条目后端硬故障 → 批次完成，逐项 Applied/Failed + 原因，批次可见性仅提交者与 admin。
+
+单测命令（日志可见场景、判定依据与状态迁移）：
+
+```bash
+go test ./internal/orchestrator/ -run TestManifest -v -count=1
+```
+
+## 8. 代码结构
 
 ```
-internal/model          声明模型、状态机、资源向量与派生用量
+internal/model          声明模型、状态机、资源向量与派生用量；清单/批次类型与内容寻址 ID
 internal/errors         可分类错误类型
 internal/store          原子文件持久化（JSON + tmp/fsync/rename）
-internal/quota          租户配额 / 集群容量的保留量结算
+internal/quota          租户配额 / 集群容量的保留量结算（含整批净变化 CheckNet）
 internal/resource       可注入故障的幂等模拟资源后端 + 重启 reattach
-internal/orchestrator   CRUD、授权、确定性优先操作队列、可恢复收敛循环
+internal/orchestrator   CRUD、授权、确定性优先操作队列、可恢复收敛循环；
+                        清单预览/应用（manifest*.go）与批次收敛跟踪
 cmd/demo                本地端到端演示
 ```
